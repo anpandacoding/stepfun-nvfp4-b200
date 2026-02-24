@@ -70,8 +70,41 @@ def quantize_tensor_nvfp4(weight: torch.Tensor):
     return packed, w_scale, w_scale_2
 
 
-def repack_shard(shard_path: Path) -> dict[str, str]:
+def _load_calibrated_input_amax(ckpt_dir: Path) -> dict[str, torch.Tensor]:
+    """Load per-expert input amax from calibration, if available."""
+    calib_path = ckpt_dir / "_calib" / "expert_input_amax.pt"
+    if not calib_path.exists():
+        log.warning("No calibrated expert_input_amax.pt found at %s — using fallback.", calib_path)
+        return {}
+    data = torch.load(str(calib_path), map_location="cpu", weights_only=True)
+    log.info("Loaded calibrated input_amax for %d MoELinear projections.", len(data))
+    return data
+
+
+def _get_input_scale(calib_amax: dict[str, torch.Tensor], tensor_name: str, num_experts: int) -> torch.Tensor:
+    """Get per-expert input_scale from calibration data, or fall back to default.
+
+    tensor_name is e.g. 'model.layers.3.moe.up_proj.weight'
+    calib keys are e.g. 'model.layers.3.moe.up_proj'
+    """
+    module_name = tensor_name.replace(".weight", "")
+    if module_name in calib_amax:
+        amax = calib_amax[module_name]
+        scale = amax.clamp(min=1e-12).float()
+        calibrated = (scale > 0).sum().item()
+        if calibrated > 0:
+            median_scale = scale[scale > 0].median()
+            scale[scale == 0] = median_scale
+            log.debug("  Using calibrated input_scale for %s (%d/%d experts calibrated)",
+                      module_name, calibrated, num_experts)
+            return scale
+    return DEFAULT_INPUT_SCALE.expand(num_experts).clone()
+
+
+def repack_shard(shard_path: Path, calib_amax: dict[str, torch.Tensor] | None = None) -> dict[str, str]:
     """Repack a single safetensors shard.  Returns the weight_map entries."""
+    if calib_amax is None:
+        calib_amax = {}
     log.info("Processing %s …", shard_path.name)
 
     tensors: dict[str, torch.Tensor] = {}
@@ -95,7 +128,9 @@ def repack_shard(shard_path: Path) -> dict[str, str]:
             new_tensors[base] = packed
             new_tensors[base.replace(".weight", ".weight_scale")] = w_scale
             new_tensors[base.replace(".weight", ".weight_scale_2")] = w_scale_2
-            new_tensors[base.replace(".weight", ".input_scale")] = DEFAULT_INPUT_SCALE.clone()
+            num_experts = t.shape[0]
+            input_scale = _get_input_scale(calib_amax, name, num_experts)
+            new_tensors[base.replace(".weight", ".input_scale")] = input_scale
 
             repacked += 1
             log.info(
@@ -152,11 +187,13 @@ def main():
     shards = sorted(ckpt_dir.glob("model-*.safetensors"))
     log.info("Found %d shard(s) in %s", len(shards), ckpt_dir)
 
+    calib_amax = _load_calibrated_input_amax(ckpt_dir)
+
     full_weight_map: dict[str, str] = {}
     total_t0 = time.time()
 
     for shard_path in shards:
-        shard_map = repack_shard(shard_path)
+        shard_map = repack_shard(shard_path, calib_amax)
         full_weight_map.update(shard_map)
 
     update_index(ckpt_dir, full_weight_map)

@@ -63,6 +63,26 @@ CALIB_MAX_SEQ_LEN = 512
 CALIB_BATCH_SIZE = 1
 TP_SIZE = 3  # 3× B200 GPUs; set to 0 for auto-detect from torch.cuda.device_count()
 
+_NVFP4_BLOCK_CFG = {
+    "num_bits": (2, 1),
+    "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+    "enable": True,
+    "pass_through_bwd": True,
+}
+
+STEPFUN_NVFP4_MLP_ONLY_CFG = {
+    "quant_cfg": {
+        "*self_attn*": {"enable": False},
+        "*moe.gate*": {"enable": False},
+        "*share_expert*": {"enable": False},
+        "*lm_head*": {"enable": False},
+        "*output_quantizer": {"enable": False},
+        "*bmm_quantizer": {"enable": False},
+        "*softmax_quantizer": {"enable": False},
+    },
+    "algorithm": "max",
+}
+
 # Multi-source calibration data.  Diverse domains maximise the chance that
 # the MoE router activates every expert at least once during calibration.
 # Each entry: (dataset_id, config_or_None, text_field, per-source cap).
@@ -226,6 +246,9 @@ def _ensure_weight_quantizer_calibrated(model: torch.nn.Module) -> int:
     """
     patched = 0
     for name, module in model.named_modules():
+        if ".gate" in name:
+            continue
+
         wq = getattr(module, "weight_quantizer", None)
         if wq is None:
             continue
@@ -245,6 +268,96 @@ def _ensure_weight_quantizer_calibrated(model: torch.nn.Module) -> int:
         log.info("  Patched %s.weight_quantizer  _amax=%.4f", name, amax.max().item())
 
     return patched
+
+
+def _disable_gate_router_quantizers(model: torch.nn.Module) -> int:
+    """Disable NVFP4 quantization on MoE gate/router modules.
+
+    The gate (router) is a small linear projection that computes expert routing
+    scores.  Quantizing it to FP4 can degrade routing quality and destabilise
+    the mixture.  This walks the model and disables any quantizers found on
+    modules whose name contains 'gate'.
+    """
+    disabled = 0
+    for name, module in model.named_modules():
+        if ".gate" not in name:
+            continue
+
+        for attr in ("weight_quantizer", "input_quantizer", "output_quantizer"):
+            q = getattr(module, attr, None)
+            if q is None:
+                continue
+            q._if_quant = False
+            q._if_calib = False
+            q.disable()
+            disabled += 1
+            log.info("  Disabled %s.%s (gate/router — kept in full precision)", name, attr)
+
+    if disabled:
+        log.info("Disabled %d quantizer(s) on MoE gate/router modules.", disabled)
+    else:
+        log.info("No gate/router quantizers found to disable.")
+    return disabled
+
+
+class _ExpertInputScaleTracker:
+    """Hooks into MoELinear.forward to collect per-expert input activation amax.
+
+    During calibration, each expert sees a different subset of tokens.  This
+    tracker records the running max absolute activation value per expert per
+    projection (up_proj, gate_proj, down_proj) so repack_moe_fp4.py can use
+    calibrated input_scale values instead of a hardcoded fallback.
+    """
+
+    def __init__(self, model: torch.nn.Module):
+        self.input_amax: dict[str, torch.Tensor] = {}
+        self._hooks: list = []
+
+        for name, module in model.named_modules():
+            if "MoELinear" not in type(module).__name__:
+                continue
+            num_experts = getattr(module, "num_experts", None)
+            if num_experts is None:
+                continue
+            amax_buf = torch.zeros(num_experts, dtype=torch.float32)
+            self.input_amax[name] = amax_buf
+
+            def _make_hook(amax_ref):
+                def _hook(mod, inputs, output):
+                    x = inputs[0]
+                    expert_id = inputs[1] if len(inputs) > 1 else None
+                    if expert_id is None or x.numel() == 0:
+                        return
+                    with torch.no_grad():
+                        val = x.detach().float().abs().amax().item()
+                        eid = expert_id if isinstance(expert_id, int) else expert_id.item()
+                        if eid < len(amax_ref):
+                            amax_ref[eid] = max(amax_ref[eid].item(), val)
+                return _hook
+
+            h = module.register_forward_hook(_make_hook(amax_buf))
+            self._hooks.append(h)
+
+    def save_and_cleanup(self, save_path: str):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+        save_dir = Path(save_path)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        out = {}
+        active = 0
+        for name, amax in self.input_amax.items():
+            out[name] = amax
+            hit = (amax > 0).sum().item()
+            active += hit
+        torch.save(out, str(save_dir / "expert_input_amax.pt"))
+        log.info(
+            "Saved calibrated expert input_amax for %d MoELinear modules "
+            "(%d expert-projections with data) → %s",
+            len(out), active, save_dir / "expert_input_amax.pt",
+        )
+        return out
 
 
 class _ExpertCoverageTracker:
@@ -512,12 +625,63 @@ def _patch_max_calibrator_for_bf16():
     return True
 
 
+def _verify_quantization(model: torch.nn.Module):
+    """Log which layers are actually quantized vs bf16, with sizes."""
+    log.info("=" * 70)
+    log.info("QUANTIZATION VERIFICATION")
+    log.info("=" * 70)
+
+    enabled = 0
+    disabled = 0
+    total_bf16_bytes = 0
+    total_quant_bytes = 0
+
+    for name, module in model.named_modules():
+        wq = getattr(module, "weight_quantizer", None)
+        weight = getattr(module, "weight", None)
+        if weight is None or not isinstance(weight, torch.nn.Parameter):
+            continue
+
+        size_bytes = weight.nelement() * weight.element_size()
+        size_mb = size_bytes / (1024 * 1024)
+        fp4_mb = weight.nelement() / 2 / (1024 * 1024)
+
+        is_enabled = wq is not None and getattr(wq, "_if_quant", False)
+
+        if is_enabled:
+            enabled += 1
+            total_quant_bytes += weight.nelement() // 2
+            if enabled <= 6:
+                log.info(
+                    "  [NVFP4] %-55s  %s  %s  %.1f MB → ~%.1f MB",
+                    name, list(weight.shape), weight.dtype, size_mb, fp4_mb,
+                )
+            elif enabled == 7:
+                log.info("  ... (more NVFP4 layers)")
+        else:
+            disabled += 1
+            total_bf16_bytes += size_bytes
+            if "gate_proj" in name or "up_proj" in name or "down_proj" in name or "moe.gate" in name:
+                if disabled <= 10 or "moe.gate" in name and disabled <= 50:
+                    log.info(
+                        "  [bf16]  %-55s  %s  %s  %.1f MB",
+                        name, list(weight.shape), weight.dtype, size_mb,
+                    )
+
+    log.info("-" * 70)
+    log.info("  Quantized (NVFP4) layers: %d  (~%.1f GB packed)", enabled, total_quant_bytes / (1024**3))
+    log.info("  Unquantized (bf16) layers: %d  (%.1f GB)", disabled, total_bf16_bytes / (1024**3))
+    log.info("  Estimated checkpoint: ~%.1f GB", (total_quant_bytes + total_bf16_bytes) / (1024**3))
+    log.info("=" * 70)
+
+
 def quantize_model(
     model,
     tokenizer,
     calib_size: int = CALIB_SIZE,
     calib_max_seq_len: int = CALIB_MAX_SEQ_LEN,
     calib_batch_size: int = CALIB_BATCH_SIZE,
+    export_dir: str = DEFAULT_EXPORT_DIR,
 ):
     """Run ModelOpt NVFP4 PTQ on the loaded model (in-place)."""
     import modelopt.torch.quantization as mtq
@@ -534,6 +698,7 @@ def quantize_model(
     )
 
     coverage = _ExpertCoverageTracker(model)
+    input_scales = _ExpertInputScaleTracker(model)
 
     def forward_loop(model):
         import time
@@ -570,15 +735,22 @@ def quantize_model(
     log.info("Starting NVFP4 quantization via ModelOpt …")
     _log_gpu_memory("before quantization")
 
-    model = mtq.quantize(model, mtq.NVFP4_DEFAULT_CFG, forward_loop)
+    model = mtq.quantize(model, STEPFUN_NVFP4_MLP_ONLY_CFG, forward_loop)
 
     log.info("Quantization complete.")
+
+    log.info("[quantize] Disabling quantization on MoE gate/router modules …")
+    _disable_gate_router_quantizers(model)
+
     log.info("[quantize] Patching calibrators post-quantization …")
     _patch_tensorquantizer_calibrator_compat(model)
     log.info("[quantize] Reporting expert coverage …")
     coverage.report_and_cleanup()
+    log.info("[quantize] Saving calibrated expert input scales …")
+    input_scales.save_and_cleanup(str(Path(export_dir) / "_calib"))
 
     mtq.print_quant_summary(model)
+    _verify_quantization(model)
     _log_gpu_memory("after quantization")
     _log_system_memory("after quantization")
     return model
@@ -890,6 +1062,7 @@ def main():
             model, tokenizer,
             calib_size=args.calib_size,
             calib_max_seq_len=args.calib_max_seq_len,
+            export_dir=args.export_dir,
         )
         try:
             save_quantized_state(model, quant_state_dir)
